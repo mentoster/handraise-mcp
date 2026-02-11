@@ -4,7 +4,11 @@
   "private": true,
   "type": "module",
   "bin": {
-    "handraise-mcp": "./dist/src/mcp/server.js"
+    "handraise-mcp": "./dist/src/mcp/server.js",
+    "raisehand-mcp": "./dist/src/mcp/server.js",
+    "handraise-ask-tui": "./dist/src/mcp/ask-user-cli.js",
+    "handraise-ask-cli": "./dist/src/mcp/ask-user-cli.js",
+    "handrize-ask-cli": "./dist/src/mcp/ask-user-cli.js"
   },
   "exports": {
     ".": {
@@ -20,10 +24,18 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "test": "npm run build && node --test dist/test",
-    "mcp:start": "node ./dist/src/mcp/server.js"
+    "mcp:start": "node ./dist/src/mcp/server.js",
+    "raisehand:start": "node ./dist/src/mcp/server.js",
+    "raisehand-start": "node ./dist/src/mcp/server.js",
+    "ask-tui:start": "node ./dist/src/mcp/ask-user-cli.js",
+    "ask-cli:start": "node ./dist/src/mcp/ask-user-cli.js",
+    "handraise-ask-tui": "node ./dist/src/mcp/ask-user-cli.js",
+    "handraise-ask-cli": "node ./dist/src/mcp/ask-user-cli.js",
+    "handrize-ask-cli": "node ./dist/src/mcp/ask-user-cli.js"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.26.0",
+    "boxen": "^8.0.1",
     "zod": "^3.25.76"
   },
   "devDependencies": {
