@@ -134,6 +134,52 @@ Most consumers only need these exports:
 - Types: `McpApprovalPolicy`, `McpToolCall`, `HandraiseAdapter`, `McpApprovalRequest`, `McpApprovalDecision`
 - Errors: `McpHumanApprovalDeniedError`, `McpHumanApprovalInvalidDecisionError`
 
+## OpenCode MCP integration
+
+Use the built-in stdio MCP server to connect this repository directly from a local `opencode.json`.
+
+1. Build the project:
+
+```bash
+npm install
+npm run build
+```
+
+2. Configure OpenCode in this folder (`opencode.json`):
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "handraise": {
+      "type": "local",
+      "enabled": true,
+      "command": ["node", "./dist/src/mcp/server.js"],
+      "environment": {
+        "HANDRAISE_DEFAULT_REQUIRE_APPROVAL": "{env:HANDRAISE_DEFAULT_REQUIRE_APPROVAL}",
+        "HANDRAISE_ALLOWLIST": "{env:HANDRAISE_ALLOWLIST}",
+        "HANDRAISE_DENYLIST": "{env:HANDRAISE_DENYLIST}"
+      },
+      "timeout": 10000
+    }
+  }
+}
+```
+
+3. Start OpenCode in this repository and call tools from the `handraise` MCP server namespace.
+
+Environment values:
+
+- `HANDRAISE_DEFAULT_REQUIRE_APPROVAL`: `true` or `false`.
+- `HANDRAISE_ALLOWLIST`: comma-separated tool names bypassing approval.
+- `HANDRAISE_DENYLIST`: comma-separated tool names always requiring approval.
+
+Troubleshooting:
+
+- `Error: Cannot find module ./dist/src/mcp/server.js`: run `npm run build` first.
+- MCP server starts but no tools appear: verify `command` path is exactly `./dist/src/mcp/server.js` and `type` is `local`.
+- Unexpected approval behavior: check env values and confirm CSV formatting for allowlist/denylist.
+
 ## Development
 
 Prerequisites:

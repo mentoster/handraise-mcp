@@ -1,0 +1,16 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "handraise": {
+      "type": "local",
+      "enabled": true,
+      "command": ["node", "./dist/src/mcp/server.js"],
+      "environment": {
+        "HANDRAISE_DEFAULT_REQUIRE_APPROVAL": "{env:HANDRAISE_DEFAULT_REQUIRE_APPROVAL}",
+        "HANDRAISE_ALLOWLIST": "{env:HANDRAISE_ALLOWLIST}",
+        "HANDRAISE_DENYLIST": "{env:HANDRAISE_DENYLIST}"
+      },
+      "timeout": 10000
+    }
+  }
+}
