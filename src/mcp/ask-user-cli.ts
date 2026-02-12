@@ -1,4 +1,6 @@
 import process from "node:process";
+import { readdir } from "node:fs/promises";
+import path from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { createInterface } from "node:readline/promises";
 import readline from "node:readline";
@@ -15,6 +17,10 @@ import {
 
 const POLL_INTERVAL_MS = 600;
 const TUI_REFRESH_MS = 180;
+const WAITING_FOOTER = "Waiting for pending requests or reviews...";
+const FILE_MATCH_LIMIT = 6;
+const FILE_SCAN_LIMIT = 4000;
+const SKIP_FILE_DIRS = new Set([".git", "node_modules", "dist"]);
 
 const COLOR = {
   reset: "\x1b[0m",
@@ -30,9 +36,12 @@ const COLOR = {
 type PromptDraft = {
   markedOptionIndexes: Set<number>;
   activeRow: number;
+  customResponse: string;
+  activeFileMatch: number;
 };
 
 type KeypressEvent = {
+  value: string;
   key: readline.Key;
 };
 
@@ -40,6 +49,7 @@ type TuiMode = "list" | "answer";
 
 type AnswerRow =
   | { kind: "option"; label: string; optionIndex: number }
+  | { kind: "custom"; label: string }
   | { kind: "submit"; label: string }
   | { kind: "decline"; label: string }
   | { kind: "cancel"; label: string };
@@ -61,12 +71,25 @@ export async function runAskUserCli(argv: string[] = process.argv.slice(2)): Pro
 
   let pending: AskUserBridgePrompt[] = [];
   let selectedIndex = 0;
-  let footer = "Waiting for prompts...";
+  let footer = WAITING_FOOTER;
   let running = true;
   let busy = false;
   let handled = false;
   let mode: TuiMode = "list";
+  let lastFrame = "";
   const drafts = new Map<string, PromptDraft>();
+  const workspaceRoot = process.cwd();
+  let workspaceFiles: string[] = [];
+  let workspaceFilesReady = false;
+  collectWorkspaceFiles(workspaceRoot, FILE_SCAN_LIMIT)
+    .then((files) => {
+      workspaceFiles = files;
+      workspaceFilesReady = true;
+    })
+    .catch(() => {
+      workspaceFiles = [];
+      workspaceFilesReady = true;
+    });
 
   const onSignal = () => {
     running = false;
@@ -90,7 +113,19 @@ export async function runAskUserCli(argv: string[] = process.argv.slice(2)): Pro
       }
 
       const active = pending[selectedIndex];
-      renderTui(statePath, pending, selectedIndex, footer, once, mode, drafts, active);
+      lastFrame = renderTui(
+        statePath,
+        pending,
+        selectedIndex,
+        footer,
+        once,
+        mode,
+        drafts,
+        active,
+        lastFrame,
+        workspaceFiles,
+        workspaceFilesReady
+      );
 
       const event = await waitForKeypress(TUI_REFRESH_MS);
       if (!event || busy) continue;
@@ -128,7 +163,8 @@ export async function runAskUserCli(argv: string[] = process.argv.slice(2)): Pro
             mode = "answer";
             const draft = getPromptDraft(drafts, active.id);
             draft.activeRow = 0;
-            footer = `Answer mode for prompt ${active.id}.`;
+            draft.activeFileMatch = 0;
+            footer = `Answer mode for request ${active.id}.`;
             continue;
           }
           default:
@@ -144,16 +180,49 @@ export async function runAskUserCli(argv: string[] = process.argv.slice(2)): Pro
       const rows = getAnswerRows(active);
       const draft = getPromptDraft(drafts, active.id);
       draft.activeRow = clampIndex(draft.activeRow, rows.length);
+      const selectedRow = rows[draft.activeRow];
+      const fileTag = selectedRow?.kind === "custom"
+        ? getFileTagSuggestions(draft.customResponse, workspaceFiles)
+        : undefined;
+
+      if (fileTag) {
+        draft.activeFileMatch = clampIndex(draft.activeFileMatch, fileTag.matches.length);
+      } else {
+        draft.activeFileMatch = 0;
+      }
 
       switch (key.name) {
         case "down":
         {
+          if (selectedRow?.kind === "custom" && fileTag && fileTag.matches.length > 0) {
+            draft.activeFileMatch = (draft.activeFileMatch + 1) % fileTag.matches.length;
+            continue;
+          }
           draft.activeRow = (draft.activeRow + 1) % rows.length;
           continue;
         }
         case "up":
         {
+          if (selectedRow?.kind === "custom" && fileTag && fileTag.matches.length > 0) {
+            draft.activeFileMatch = (draft.activeFileMatch - 1 + fileTag.matches.length) % fileTag.matches.length;
+            continue;
+          }
           draft.activeRow = (draft.activeRow - 1 + rows.length) % rows.length;
+          continue;
+        }
+        case "backspace": {
+          const row = rows[draft.activeRow];
+          if (row?.kind !== "custom") continue;
+          if (draft.customResponse.length === 0) continue;
+          draft.customResponse = draft.customResponse.slice(0, -1);
+          draft.activeFileMatch = 0;
+          continue;
+        }
+        case "tab": {
+          const row = rows[draft.activeRow];
+          if (row?.kind !== "custom" || !fileTag || fileTag.matches.length === 0) continue;
+          draft.customResponse = applyFileTagMatch(draft.customResponse, fileTag, draft.activeFileMatch);
+          draft.activeFileMatch = 0;
           continue;
         }
         case "return": {
@@ -163,6 +232,38 @@ export async function runAskUserCli(argv: string[] = process.argv.slice(2)): Pro
           if (row.kind === "option") {
             toggleMarkedOption(draft.markedOptionIndexes, row.optionIndex);
             footer = `Toggled option ${row.optionIndex + 1} for prompt ${active.id}.`;
+            continue;
+          }
+
+          if (row.kind === "custom") {
+            if (fileTag && fileTag.matches.length > 0) {
+              draft.customResponse = applyFileTagMatch(draft.customResponse, fileTag, draft.activeFileMatch);
+              draft.activeFileMatch = 0;
+              footer = "Inserted file path into response.";
+              continue;
+            }
+
+            if (isFreeformPrompt(active)) {
+              busy = true;
+              const response = buildAcceptedResponse(active, draft);
+              const stored = await submitAskUserResponse(statePath, response);
+              busy = false;
+
+              if (stored) {
+                drafts.delete(active.id);
+                handled = true;
+                mode = "list";
+              }
+
+              footer = stored
+                ? `Submitted response for ${active.id}.`
+                : `Request ${active.id} disappeared before response.`;
+
+              if (once && stored) running = false;
+              continue;
+            }
+
+            footer = `Editing custom response for prompt ${active.id}.`;
             continue;
           }
 
@@ -198,14 +299,22 @@ export async function runAskUserCli(argv: string[] = process.argv.slice(2)): Pro
           continue;
         }
         default:
+        {
+          const row = rows[draft.activeRow];
+          if (row?.kind !== "custom") continue;
+          const text = sanitizeTypedInput(event.value, key);
+          if (text === undefined) continue;
+          draft.customResponse += text;
+          draft.activeFileMatch = 0;
           continue;
+        }
       }
     }
   } finally {
     process.removeListener("SIGINT", onSignal);
     process.removeListener("SIGTERM", onSignal);
     if (stdin.isTTY) stdin.setRawMode(false);
-    stdout.write("\x1Bc");
+    stdout.write("\x1b[?25h\x1b[0m\n");
   }
 }
 
@@ -217,45 +326,47 @@ function renderTui(
   once: boolean,
   mode: TuiMode,
   drafts: Map<string, PromptDraft>,
-  active: AskUserBridgePrompt | undefined
-): void {
-  process.stdout.write("\x1Bc");
-  process.stdout.write(`${COLOR.bold}${COLOR.cyan}raisehand ask TUI${COLOR.reset}\n`);
-  process.stdout.write(`${COLOR.gray}Bridge:${COLOR.reset} ${statePath}${once ? " (once mode)" : ""}\n\n`);
-  process.stdout.write(`${renderHintsBox(mode)}\n\n`);
+  active: AskUserBridgePrompt | undefined,
+  previousFrame: string,
+  workspaceFiles: string[],
+  workspaceFilesReady: boolean
+): string {
+  let frame = "";
+  frame += `${COLOR.bold}${COLOR.cyan}raisehand ask TUI${COLOR.reset}\n`;
+  frame += `${COLOR.gray}Bridge:${COLOR.reset} ${statePath}${once ? " (once mode)" : ""}\n\n`;
 
   if (pending.length === 0 || !active) {
-    process.stdout.write(`${COLOR.gray}No pending prompts. Waiting...${COLOR.reset}\n\n`);
-    process.stdout.write(`${COLOR.magenta}${footer}${COLOR.reset}\n`);
-    return;
+    frame += `${COLOR.magenta}${WAITING_FOOTER}${COLOR.reset}\n`;
+    frame += `${COLOR.gray}No pending requests or reviews.${COLOR.reset}\n\n`;
+    frame += `${renderHintsBox(mode)}\n`;
+    return writeFrame(frame, previousFrame);
   }
 
-  process.stdout.write(`${COLOR.bold}Pending prompts: ${pending.length}${COLOR.reset}\n`);
+  frame += `${COLOR.bold}Pending requests or reviews: ${pending.length}${COLOR.reset}\n`;
   for (let i = 0; i < Math.min(pending.length, 10); i += 1) {
     const prompt = pending[i]!;
     const title = sanitizePromptText(prompt.header) ?? prompt.question;
     const prefix = i === selectedIndex ? `${COLOR.yellow}>${COLOR.reset}` : " ";
-    process.stdout.write(`${prefix} ${i + 1}. ${title}\n`);
+    frame += `${prefix} ${i + 1}. ${title}\n`;
   }
 
-  process.stdout.write("\n----------------------------------------\n");
-  process.stdout.write(`${COLOR.gray}Prompt id:${COLOR.reset} ${active.id}\n`);
-  if (active.header) process.stdout.write(`${COLOR.bold}${active.header}${COLOR.reset}\n`);
-  process.stdout.write(`${active.question}\n`);
+  frame += "\n----------------------------------------\n";
+  frame += `${COLOR.gray}Prompt id:${COLOR.reset} ${active.id}\n`;
+  if (active.header) frame += `${COLOR.bold}${active.header}${COLOR.reset}\n`;
+  frame += `${active.question}\n`;
 
   if (mode === "list") {
-    const listPreview = buildAnswerRowPreview(active, getPromptDraft(drafts, active.id));
-    process.stdout.write(`\n${renderPreviewBox(listPreview)}\n`);
-    process.stdout.write(`\n${COLOR.green}Press Enter to open answer mode for selected prompt.${COLOR.reset}\n`);
-    process.stdout.write(`\n${COLOR.magenta}${footer}${COLOR.reset}\n`);
-    return;
+    frame += `\n${COLOR.green}Press Enter to open response for selected request.${COLOR.reset}\n`;
+    frame += `\n${COLOR.magenta}${WAITING_FOOTER}${COLOR.reset}\n`;
+    frame += `\n${renderHintsBox(mode)}\n`;
+    return writeFrame(frame, previousFrame);
   }
 
   const rows = getAnswerRows(active);
   const draft = getPromptDraft(drafts, active.id);
   draft.activeRow = clampIndex(draft.activeRow, rows.length);
 
-  process.stdout.write(`\n${COLOR.bold}Answer Rows${COLOR.reset}\n`);
+  frame += `\n${COLOR.bold}Response${COLOR.reset}\n`;
   for (let i = 0; i < rows.length; i += 1) {
     const row = rows[i]!;
     const focused = i === draft.activeRow;
@@ -263,23 +374,48 @@ function renderTui(
     if (row.kind === "option") {
       const marked = draft.markedOptionIndexes.has(row.optionIndex);
       const mark = marked ? `${COLOR.green}[x]${COLOR.reset}` : `${COLOR.gray}[ ]${COLOR.reset}`;
-      process.stdout.write(`${cursor} ${row.optionIndex + 1}. ${mark} ${row.label}\n`);
+      frame += `${cursor} ${row.optionIndex + 1}. ${mark} ${row.label}\n`;
+      continue;
+    }
+
+    if (row.kind === "custom") {
+      const fileTag = getFileTagSuggestions(draft.customResponse, workspaceFiles);
+      const activeMatch = clampIndex(draft.activeFileMatch, fileTag?.matches.length ?? 0);
+      draft.activeFileMatch = activeMatch;
+      frame += renderCustomResponseRow(row.label, draft.customResponse, focused, fileTag, activeMatch, workspaceFilesReady);
       continue;
     }
 
     const color = row.kind === "submit" ? COLOR.green : row.kind === "decline" ? COLOR.red : COLOR.yellow;
-    process.stdout.write(`${cursor} ${color}${row.label}${COLOR.reset}\n`);
+    frame += `${cursor} ${color}${row.label}${COLOR.reset}\n`;
   }
-  process.stdout.write(`\n${COLOR.magenta}${footer}${COLOR.reset}\n`);
+  frame += `\n${COLOR.magenta}${footer}${COLOR.reset}\n`;
+  frame += `\n${renderHintsBox(mode)}\n`;
+  return writeFrame(frame, previousFrame);
+}
+
+function writeFrame(frame: string, previousFrame: string): string {
+  if (frame === previousFrame) return previousFrame;
+  process.stdout.write(`\x1b[?25l\x1b[H\x1b[J${frame}`);
+  return frame;
 }
 
 function getAnswerRows(prompt: AskUserBridgePrompt): AnswerRow[] {
-  const options = normalizeOptionLabels(prompt.options);
+  const options = normalizeOptionLabels(prompt.options, prompt.readyAnswers);
+  if (options.length === 0) {
+    return [{ kind: "custom", label: sanitizePromptText(prompt.customLabel) ?? "Response" }];
+  }
+
   const rows: AnswerRow[] = options.map((label, index) => ({
     kind: "option",
     label,
     optionIndex: index
   }));
+
+  const customAllowed = options.length === 0 || prompt.custom !== false;
+  if (customAllowed) {
+    rows.push({ kind: "custom", label: sanitizePromptText(prompt.customLabel) ?? "Custom response" });
+  }
 
   rows.push({ kind: "submit", label: "Submit answer" });
   rows.push({ kind: "decline", label: "Decline prompt" });
@@ -292,7 +428,9 @@ function getPromptDraft(drafts: Map<string, PromptDraft>, promptId: string): Pro
   if (existing) return existing;
   const created: PromptDraft = {
     markedOptionIndexes: new Set<number>(),
-    activeRow: 0
+    activeRow: 0,
+    customResponse: "",
+    activeFileMatch: 0
   };
   drafts.set(promptId, created);
   return created;
@@ -306,43 +444,53 @@ function pruneDrafts(drafts: Map<string, PromptDraft>, pending: AskUserBridgePro
 }
 
 function buildAcceptedResponse(prompt: AskUserBridgePrompt, draft: PromptDraft): AskUserBridgeResponse {
-  const options = normalizeOptionLabels(prompt.options);
+  const options = normalizeOptionLabels(prompt.options, prompt.readyAnswers);
+  const customResponse = sanitizePromptText(draft.customResponse);
   const selectedOptions = [...draft.markedOptionIndexes]
     .sort((a, b) => a - b)
     .map((index) => options[index])
     .filter((value): value is string => value !== undefined);
 
+  if (options.length === 0) {
+    return {
+      promptId: prompt.id,
+      action: "accept",
+      answer: customResponse ?? "",
+      respondedAt: new Date().toISOString()
+    };
+  }
+
+  const multiple = prompt.multiple ?? false;
+
+  if (multiple) {
+    const answer = customResponse ? [...selectedOptions, customResponse] : selectedOptions;
+    return {
+      promptId: prompt.id,
+      action: "accept",
+      answer,
+      selectedOptions,
+      ...(customResponse !== undefined ? { customResponse } : {}),
+      respondedAt: new Date().toISOString()
+    };
+  }
+
+  const answer = selectedOptions.length > 0 ? selectedOptions[0]! : customResponse ?? "";
+
   return {
     promptId: prompt.id,
     action: "accept",
-    answer: selectedOptions,
+    answer,
     selectedOptions,
+    ...(customResponse !== undefined ? { customResponse } : {}),
     respondedAt: new Date().toISOString()
   };
-}
-
-function buildAnswerRowPreview(prompt: AskUserBridgePrompt, draft: PromptDraft): string {
-  const rows = getAnswerRows(prompt);
-  if (rows.length === 0) return "No answer rows";
-
-  const activeRow = clampIndex(draft.activeRow, rows.length);
-  return rows
-    .map((row, index) => {
-      const cursor = index === activeRow ? "=>" : "  ";
-      if (row.kind === "option") {
-        const mark = draft.markedOptionIndexes.has(row.optionIndex) ? "[x]" : "[ ]";
-        return `${cursor} ${mark} ${row.label}`;
-      }
-      return `${cursor} ${row.label}`;
-    })
-    .join("\n");
 }
 
 function renderHintsBox(mode: TuiMode): string {
   const lines =
     mode === "list"
-      ? ["UP/DOWN: choose prompt", "ENTER: open answer", "ESC: exit TUI"]
-      : ["UP/DOWN: choose row", "ENTER: toggle/confirm", "ESC: back to prompts"];
+      ? ["UP/DOWN: choose request", "ENTER: open response", "ESC: exit TUI"]
+      : ["Type response, @ to tag file", "TAB/ENTER: insert file  ENTER: submit", "BACKSPACE: edit  ESC: back"];
 
   return boxen(lines.join("\n"), {
     borderStyle: "round",
@@ -352,13 +500,118 @@ function renderHintsBox(mode: TuiMode): string {
   });
 }
 
-function renderPreviewBox(preview: string): string {
-  return boxen(preview, {
+function renderCustomResponseRow(
+  label: string,
+  value: string,
+  focused: boolean,
+  fileTag: FileTagSuggestions | undefined,
+  activeMatch: number,
+  workspaceFilesReady: boolean
+): string {
+  const text = value.length > 0 ? value : `${COLOR.gray}<type here>${COLOR.reset}`;
+  const body = boxen(text, {
     borderStyle: "round",
-    borderColor: "green",
-    title: "Answer Row Preview",
+    borderColor: focused ? "green" : "gray",
+    title: label,
     padding: { top: 0, right: 1, bottom: 0, left: 1 }
   });
+
+  const prefix = focused ? `${COLOR.yellow}>${COLOR.reset} ` : "  ";
+  let rendered = `${prefix}${body.split("\n").join("\n  ")}\n`;
+
+  if (!focused || !fileTag) return rendered;
+
+  if (fileTag.matches.length === 0) {
+    const emptyText = workspaceFilesReady
+      ? `${COLOR.gray}No file matches for @${fileTag.query}.${COLOR.reset}`
+      : `${COLOR.gray}Indexing files...${COLOR.reset}`;
+    const emptyBox = boxen(emptyText, {
+      borderStyle: "round",
+      borderColor: "gray",
+      title: "File Tag",
+      padding: { top: 0, right: 1, bottom: 0, left: 1 }
+    });
+    rendered += `  ${emptyBox.split("\n").join("\n  ")}\n`;
+    return rendered;
+  }
+
+  const options = fileTag.matches
+    .map((match, index) => `${index === activeMatch ? `${COLOR.yellow}>${COLOR.reset}` : " "} @${match}`)
+    .join("\n");
+  const matchBox = boxen(options, {
+    borderStyle: "round",
+    borderColor: "cyan",
+    title: "File Tag Matches",
+    padding: { top: 0, right: 1, bottom: 0, left: 1 }
+  });
+  rendered += `  ${matchBox.split("\n").join("\n  ")}\n`;
+  return rendered;
+}
+
+type FileTagSuggestions = {
+  tokenStart: number;
+  tokenEnd: number;
+  query: string;
+  matches: string[];
+};
+
+function getFileTagSuggestions(value: string, workspaceFiles: string[]): FileTagSuggestions | undefined {
+  const match = /(?:^|\s)@([^\s]*)$/.exec(value);
+  if (!match) return undefined;
+
+  const query = match[1] ?? "";
+  const tokenEnd = value.length;
+  const tokenStart = tokenEnd - query.length - 1;
+  const normalizedQuery = query.toLowerCase();
+
+  const matches = workspaceFiles
+    .filter((filePath) => {
+      if (normalizedQuery.length === 0) return true;
+      return filePath.toLowerCase().includes(normalizedQuery);
+    })
+    .slice(0, FILE_MATCH_LIMIT);
+
+  return { tokenStart, tokenEnd, query, matches };
+}
+
+function applyFileTagMatch(value: string, suggestions: FileTagSuggestions, activeMatch: number): string {
+  const selected = suggestions.matches[activeMatch];
+  if (!selected) return value;
+  return `${value.slice(0, suggestions.tokenStart)}@${selected} `;
+}
+
+async function collectWorkspaceFiles(root: string, limit: number): Promise<string[]> {
+  const output: string[] = [];
+  const queue: string[] = [root];
+
+  while (queue.length > 0 && output.length < limit) {
+    const current = queue.shift();
+    if (!current) break;
+
+    let entries;
+    try {
+      entries = await readdir(current, { withFileTypes: true, encoding: "utf8" });
+    } catch {
+      continue;
+    }
+
+    for (const entry of entries) {
+      if (output.length >= limit) break;
+      const fullPath = path.join(current, entry.name);
+      if (entry.isDirectory()) {
+        if (SKIP_FILE_DIRS.has(entry.name)) continue;
+        queue.push(fullPath);
+        continue;
+      }
+
+      if (!entry.isFile()) continue;
+      const relativePath = path.relative(root, fullPath);
+      if (relativePath.length === 0) continue;
+      output.push(relativePath.split(path.sep).join("/"));
+    }
+  }
+
+  return output.sort((a, b) => a.localeCompare(b));
 }
 
 function toggleMarkedOption(indexes: Set<number>, index: number): void {
@@ -392,13 +645,25 @@ async function waitForKeypress(timeoutMs: number): Promise<KeypressEvent | undef
       resolve(result);
     };
 
-    const onKeypress = (_value: string, key: readline.Key) => {
-      finish({ key });
+    const onKeypress = (value: string, key: readline.Key) => {
+      finish({ value, key });
     };
     const timer = setTimeout(() => finish(undefined), timeoutMs);
 
     process.stdin.on("keypress", onKeypress);
   });
+}
+
+function sanitizeTypedInput(value: string, key: readline.Key): string | undefined {
+  if (key.ctrl || key.meta) return undefined;
+  if (value.length === 0) return undefined;
+  if (key.name === "return" || key.name === "backspace" || key.name === "escape") return undefined;
+  if (value === "\u007f") return undefined;
+  return value;
+}
+
+function isFreeformPrompt(prompt: AskUserBridgePrompt): boolean {
+  return normalizeOptionLabels(prompt.options, prompt.readyAnswers).length === 0;
 }
 
 async function runLegacyCliMode(statePath: string, once: boolean): Promise<void> {
@@ -438,7 +703,7 @@ async function collectPromptResponseLegacy(
   if (prompt.header) console.log(prompt.header);
   console.log(prompt.question);
 
-  const optionLabels = normalizeOptionLabels(prompt.options);
+  const optionLabels = normalizeOptionLabels(prompt.options, prompt.readyAnswers);
   if (optionLabels.length > 0) {
     optionLabels.forEach((label, index) => {
       console.log(`  ${index + 1}. ${label}`);

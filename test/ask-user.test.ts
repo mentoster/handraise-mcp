@@ -45,6 +45,54 @@ test("buildAskUserFormRequest builds enum schema when options are provided", () 
   });
 });
 
+test("buildAskUserFormRequest includes readyAnswers as selectable options", () => {
+  const req = buildAskUserFormRequest({
+    question: "Pick deployment strategy",
+    readyAnswers: [{ label: "Canary" }, { label: "Blue/Green" }, { label: "Canary" }],
+    custom: true
+  });
+
+  assert.equal(req.message, "Pick deployment strategy\nOptions:\n- Canary\n- Blue/Green");
+  assert.deepEqual(req.optionLabels, ["Canary", "Blue/Green"]);
+  assert.deepEqual(req.requestedSchema, {
+    type: "object",
+    properties: {
+      selection: {
+        type: "string",
+        title: "Selection",
+        enum: ["Canary", "Blue/Green"]
+      },
+      customResponse: {
+        type: "string",
+        title: "Custom response"
+      }
+    },
+    required: []
+  });
+});
+
+test("buildAskUserFormRequest merges options and readyAnswers without duplicates", () => {
+  const req = buildAskUserFormRequest({
+    question: "Choose action",
+    options: [{ label: "Approve" }, { label: "Deny" }],
+    readyAnswers: [{ label: "Deny" }, { label: "Need more logs" }],
+    custom: false
+  });
+
+  assert.deepEqual(req.optionLabels, ["Approve", "Deny", "Need more logs"]);
+  assert.deepEqual(req.requestedSchema, {
+    type: "object",
+    properties: {
+      selection: {
+        type: "string",
+        title: "Selection",
+        enum: ["Approve", "Deny", "Need more logs"]
+      }
+    },
+    required: ["selection"]
+  });
+});
+
 test("parseAskUserAcceptedAnswer returns trimmed freeform text", () => {
   const answer = parseAskUserAcceptedAnswer(
     { response: "  use canary deploy  " },

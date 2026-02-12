@@ -11,6 +11,7 @@ export type AskUserToolInput = {
   header?: string;
   question: string;
   options?: AskUserOption[];
+  readyAnswers?: AskUserOption[];
   multiple?: boolean;
   custom?: boolean;
   customLabel?: string;
@@ -33,7 +34,7 @@ export function buildAskUserFormRequest(input: AskUserToolInput): {
 } {
   const header = sanitizePromptText(input.header);
   const question = sanitizePromptText(input.question);
-  const optionLabels = normalizeOptionLabels(input.options);
+  const optionLabels = normalizeOptionLabels(input.options, input.readyAnswers);
   const multiple = input.multiple ?? false;
   const custom = input.custom ?? true;
 
@@ -145,13 +146,17 @@ export function sanitizePromptText(value: string | undefined): string | undefine
   return trimmed.length > 0 ? trimmed : undefined;
 }
 
-export function normalizeOptionLabels(options: AskUserToolInput["options"]): string[] {
-  if (!options) return [];
+export function normalizeOptionLabels(
+  options: AskUserToolInput["options"],
+  readyAnswers?: AskUserToolInput["readyAnswers"]
+): string[] {
+  const candidateOptions = [...(options ?? []), ...(readyAnswers ?? [])];
+  if (candidateOptions.length === 0) return [];
 
   const unique = new Set<string>();
   const normalized: string[] = [];
 
-  for (const option of options) {
+  for (const option of candidateOptions) {
     const label = sanitizePromptText(option.label);
     if (!label || unique.has(label)) continue;
     unique.add(label);
